@@ -1,0 +1,7 @@
+{
+  "name": "Overseer",
+  "version": "1.0.0",
+  "description": "A GUI-based systemd service manager.",
+  "owner": "galaxyg144 @ Knittight",
+  "dependencies": []
+}
