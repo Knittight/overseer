@@ -18,12 +18,16 @@ command -v python3 >/dev/null || {
   exit 1
 }
 
-python3 - <<EOF 2>/dev/null || {
+# Check PyGObject / GTK4
+python3 - <<EOF 2>/dev/null
 import gi
 gi.require_version("Gtk", "4.0")
 EOF
-echo "❌ PyGObject / GTK4 not installed"
-exit 1
+
+if [ $? -ne 0 ]; then
+  echo "❌ PyGObject / GTK4 not installed"
+  exit 1
+fi
 
 # -------- stage files --------
 echo "📦 Staging build output..."
