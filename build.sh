@@ -35,8 +35,27 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
 install -m 755 "$SRC_FILE" "$BUILD_DIR/$APP_NAME"
-install -m 644 "overseer.desktop" "$BUILD_DIR/overseer.desktop"
 
-echo "✅ Build complete"
-echo "📂 Output: $BUILD_DIR/$APP_NAME"
-echo "➡ knit will install this to /usr/local/bin"
+# Install to user directories
+# Icon
+ICON_DIR="$HOME/.local/share/icons/hicolor/scalable/apps"
+mkdir -p "$ICON_DIR"
+install -m 644 "overseer.svg" "$ICON_DIR/overseer.svg"
+
+# Desktop file
+DESKTOP_DIR="$HOME/.local/share/applications"
+mkdir -p "$DESKTOP_DIR"
+install -m 644 "overseer.desktop" "$DESKTOP_DIR/overseer.desktop"
+
+# Update caches
+if command -v gtk-update-icon-cache >/dev/null; then
+    gtk-update-icon-cache -f -t "$HOME/.local/share/icons/hicolor" || true
+fi
+if command -v update-desktop-database >/dev/null; then
+    update-desktop-database "$DESKTOP_DIR" || true
+fi
+
+echo "✅ Build and install complete"
+echo "📂 Output binary: $BUILD_DIR/$APP_NAME"
+echo "➡ knit will install binary to /usr/local/bin"
+echo "➡ Desktop entry and icon installed to ~/.local/share"

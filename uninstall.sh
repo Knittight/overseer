@@ -13,6 +13,7 @@ fi
 
 SYSTEM_DESKTOP="/usr/share/applications/$APP_NAME.desktop"
 USER_DESKTOP="$REAL_HOME/.local/share/applications/$APP_NAME.desktop"
+USER_ICON="$REAL_HOME/.local/share/icons/hicolor/scalable/apps/$APP_NAME.svg"
 
 
 echo "🗑️  Uninstalling Overseer..."
@@ -46,6 +47,12 @@ if [ -f "$USER_DESKTOP" ]; then
     rm "$USER_DESKTOP"
 else
     echo "user desktop entry not found (skipping)"
+fi
+
+# Remove user icon
+if [ -f "$USER_ICON" ]; then
+    echo "removing user icon: $USER_ICON"
+    rm "$USER_ICON"
 fi
 
 echo "✅ Uninstall complete."
