@@ -1,8 +1,0 @@
-[Desktop Entry]
-Name=Overseer
-Comment=Manage systemd services
-Exec=overseer
-Icon=utilities-system-monitor
-Type=Application
-Categories=System;Monitor;
-Terminal=false
