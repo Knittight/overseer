@@ -11,7 +11,7 @@ from typing import Optional, List, Dict
 gi.require_version("Gtk", "4.0")
 from gi.repository import Gtk, GLib, Gio
 
-APP_ID = "dev.overseer.App"
+APP_ID = "overseer"
 
 # -------------------------------------------------
 # privilege escalation (on-demand)
