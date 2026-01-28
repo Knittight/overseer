@@ -4,7 +4,16 @@ set -e
 APP_NAME="overseer"
 BIN_PATH="/usr/local/bin/$APP_NAME"
 SYSTEM_DESKTOP="/usr/share/applications/$APP_NAME.desktop"
-USER_DESKTOP="$HOME/.local/share/applications/$APP_NAME.desktop"
+# specific user removal
+if [ -n "$SUDO_USER" ]; then
+    REAL_HOME=$(getent passwd "$SUDO_USER" | cut -d: -f6)
+else
+    REAL_HOME="$HOME"
+fi
+
+SYSTEM_DESKTOP="/usr/share/applications/$APP_NAME.desktop"
+USER_DESKTOP="$REAL_HOME/.local/share/applications/$APP_NAME.desktop"
+
 
 echo "🗑️  Uninstalling Overseer..."
 

@@ -2,7 +2,7 @@
 Name=Overseer
 Comment=Manage systemd services
 Exec=overseer
-Icon=utilities-system-monitor
+Icon=overseer.svg
 Type=Application
 Categories=System;Monitor;
 Terminal=false
