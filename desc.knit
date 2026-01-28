@@ -3,5 +3,12 @@
   "version": "1.1.0",
   "description": "A GUI-based systemd service manager.",
   "owner": "galaxyg144 @ Knittight",
-  "dependencies": []
+  "dependencies": [
+    "apt:python3-gi",
+    "apt:gir1.2-gtk-4.0",
+    "pacman:python-gobject",
+    "pacman:gtk4",
+    "dnf:python3-gobject",
+    "dnf:gtk4"
+  ]
 }
