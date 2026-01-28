@@ -1,0 +1,894 @@
+#!/usr/bin/env python3
+import os
+import sys
+import gi
+import json
+import subprocess
+import threading
+import signal
+from typing import Optional, List, Dict
+
+gi.require_version("Gtk", "4.0")
+from gi.repository import Gtk, GLib, Gio
+
+APP_ID = "dev.overseer.App"
+
+# -------------------------------------------------
+# privilege escalation (on-demand)
+# -------------------------------------------------
+def is_root():
+    """Check if running as root."""
+    return os.geteuid() == 0
+
+def run_as_root(args, parent_window=None, callback=None):
+    """Run a command with root privileges using GUI password prompt."""
+    if is_root():
+        # Already root, run directly
+        try:
+            result = subprocess.run(
+                args,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if callback:
+                callback(result.returncode == 0, result.stdout, result.stderr)
+            return result.returncode == 0, result.stdout, result.stderr
+        except Exception as e:
+            if callback:
+                callback(False, "", str(e))
+            return False, "", str(e)
+
+    # Need elevation - show password dialog
+    show_password_dialog_async(parent_window, args, callback)
+
+def show_password_dialog_async(parent, args, callback):
+    """Show password dialog and execute command asynchronously."""
+    dialog = Gtk.Window(transient_for=parent, modal=True)
+    dialog.set_title("Authentication Required")
+    dialog.set_default_size(400, 200)
+
+    # Main container
+    box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=20)
+    box.set_margin_top(20)
+    box.set_margin_bottom(20)
+    box.set_margin_start(20)
+    box.set_margin_end(20)
+    dialog.set_child(box)
+
+    # Header with icon
+    header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+
+    icon = Gtk.Image.new_from_icon_name("dialog-password")
+    icon.set_pixel_size(48)
+    header_box.append(icon)
+
+    message_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+    title_label = Gtk.Label(label="Authentication Required")
+    title_label.add_css_class("title-2")
+    title_label.set_xalign(0)
+    message_box.append(title_label)
+
+    subtitle_label = Gtk.Label(
+        label="Overseer requires administrator privileges to modify system services.",
+        wrap=True,
+        xalign=0
+    )
+    subtitle_label.add_css_class("dim-label")
+    message_box.append(subtitle_label)
+
+    header_box.append(message_box)
+    box.append(header_box)
+
+    # Password entry
+    password_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+
+    password_label = Gtk.Label(label="Password:")
+    password_label.set_width_chars(10)
+    password_label.set_xalign(1)
+    password_box.append(password_label)
+
+    password_entry = Gtk.PasswordEntry()
+    password_entry.set_hexpand(True)
+    password_entry.set_show_peek_icon(True)
+    password_box.append(password_entry)
+
+    box.append(password_box)
+
+    # Error label (hidden by default)
+    error_label = Gtk.Label()
+    error_label.add_css_class("error")
+    error_label.set_visible(False)
+    box.append(error_label)
+
+    # Buttons
+    button_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+    button_box.set_halign(Gtk.Align.END)
+
+    cancel_btn = Gtk.Button(label="Cancel")
+    button_box.append(cancel_btn)
+
+    auth_btn = Gtk.Button(label="Authenticate")
+    auth_btn.add_css_class("suggested-action")
+    button_box.append(auth_btn)
+
+    box.append(button_box)
+
+    def on_authenticate(widget):
+        password = password_entry.get_text()
+        if not password:
+            error_label.set_text("Please enter a password")
+            error_label.set_visible(True)
+            return
+
+        # Disable buttons
+        auth_btn.set_sensitive(False)
+        cancel_btn.set_sensitive(False)
+        password_entry.set_sensitive(False)
+
+        # Run command in background
+        def run_sudo():
+            import tempfile
+
+            cmd_str = ' '.join(f'"{arg}"' for arg in args)
+            script = f"""#!/bin/bash
+sudo -S {cmd_str} 2>&1
+echo "EXIT_CODE:$?"
+"""
+            try:
+                with tempfile.NamedTemporaryFile(mode='w', suffix='.sh', delete=False) as f:
+                    f.write(script)
+                    script_path = f.name
+
+                os.chmod(script_path, 0o755)
+
+                process = subprocess.Popen(
+                    [script_path],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+
+                stdout, stderr = process.communicate(input=password + '\n', timeout=30)
+                os.unlink(script_path)
+
+                success = "EXIT_CODE:0" in stdout
+                if success:
+                    stdout = stdout.replace("EXIT_CODE:0", "").strip()
+
+                GLib.idle_add(lambda: on_result(success, stdout, stderr))
+
+            except Exception as e:
+                if os.path.exists(script_path):
+                    os.unlink(script_path)
+                GLib.idle_add(lambda: on_result(False, "", str(e)))
+
+        threading.Thread(target=run_sudo, daemon=True).start()
+
+    def on_cancel(widget):
+        dialog.close()
+        if callback:
+            callback(False, "", "Authentication cancelled")
+
+    def on_result(success, stdout, stderr):
+        dialog.close()
+        if callback:
+            callback(success, stdout, stderr)
+        return False
+
+    cancel_btn.connect("clicked", on_cancel)
+    auth_btn.connect("clicked", on_authenticate)
+    password_entry.connect("activate", on_authenticate)
+
+    dialog.present()
+    password_entry.grab_focus()
+
+# -------------------------------------------------
+# systemctl / journal helpers
+# -------------------------------------------------
+def run(cmd: List[str]) -> str:
+    """Run a command and return stdout, or empty string on error."""
+    try:
+        return subprocess.check_output(
+            cmd, text=True, stderr=subprocess.DEVNULL, timeout=5
+        )
+    except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+        return ""
+
+def list_services() -> List[Dict]:
+    """Get list of all systemd services with their status."""
+    out = run([
+        "systemctl", "list-units",
+        "--type=service",
+        "--all",
+        "--output=json",
+        "--no-pager"
+    ])
+
+    if not out:
+        return []
+
+    try:
+        data = json.loads(out)
+    except json.JSONDecodeError:
+        return []
+
+    services = []
+    for u in data:
+        name = u["unit"]
+        services.append({
+            "name": name,
+            "desc": u.get("description", ""),
+            "active": u.get("active", "unknown"),
+            "sub": u.get("sub", ""),
+            "load": u.get("load", ""),
+            "enabled": run(["systemctl", "is-enabled", name]).strip() == "enabled"
+        })
+
+    return sorted(services, key=lambda x: x["name"])
+
+def ctl(action: str, service: str, callback=None, parent_window=None):
+    """Execute systemctl action with privilege escalation."""
+    if is_root():
+        # Already root, run directly in thread
+        def task():
+            try:
+                subprocess.run(
+                    ["systemctl", action, service],
+                    check=True,
+                    capture_output=True,
+                    timeout=10
+                )
+                if callback:
+                    GLib.idle_add(callback, True, None)
+            except Exception as e:
+                if callback:
+                    GLib.idle_add(callback, False, str(e))
+        threading.Thread(target=task, daemon=True).start()
+    else:
+        # Need elevation - this will handle async
+        def result_callback(success, stdout, stderr):
+            if callback:
+                GLib.idle_add(callback, success, stderr if not success else None)
+
+        run_as_root(["systemctl", action, service], parent_window, result_callback)
+
+def get_logs(service: str, lines: int = 200) -> str:
+    """Retrieve journal logs for a service."""
+    return run([
+        "journalctl",
+        "-u", service,
+        "--no-pager",
+        "-n", str(lines),
+        "--no-hostname"
+    ])
+
+# -------------------------------------------------
+# UI
+# -------------------------------------------------
+class MainWindow(Gtk.ApplicationWindow):
+    def __init__(self, app):
+        super().__init__(application=app)
+
+        # Show privilege status in title
+        if is_root():
+            self.set_title("Overseer - System Service Manager (Root)")
+        else:
+            self.set_title("Overseer - System Service Manager")
+
+        self.set_default_size(1200, 700)
+
+        self.services = []
+        self.current: Optional[Dict] = None
+        self.filter_active_only = False
+        self.log_tail_process = None
+        self.log_tail_active = False
+        self.status_monitor_active = False
+        self.status_update_timeout = None
+
+        self._build_ui()
+        self.reload()
+        self.start_status_monitor()
+
+    def _build_ui(self):
+        """Build the complete UI."""
+        # Header
+        header = Gtk.HeaderBar()
+        self.set_titlebar(header)
+
+        # Search
+        self.search = Gtk.SearchEntry()
+        self.search.set_placeholder_text("Search services…")
+        self.search.connect("search-changed", self.refresh_list)
+        header.pack_start(self.search)
+
+        # Filter toggle
+        self.filter_btn = Gtk.ToggleButton(label="Active Only")
+        self.filter_btn.connect("toggled", self.on_filter_toggled)
+        header.pack_start(self.filter_btn)
+
+        # Auto-refresh toggle
+        self.monitor_toggle = Gtk.ToggleButton(icon_name="media-playback-start-symbolic")
+        self.monitor_toggle.set_tooltip_text("Auto-refresh status (every 3 seconds)")
+        self.monitor_toggle.set_active(True)
+        self.monitor_toggle.connect("toggled", self.on_monitor_toggled)
+        header.pack_end(self.monitor_toggle)
+
+        # Refresh button
+        refresh = Gtk.Button(icon_name="view-refresh-symbolic")
+        refresh.set_tooltip_text("Reload services")
+        refresh.connect("clicked", lambda *_: self.reload())
+        header.pack_end(refresh)
+
+        # Main layout
+        paned = Gtk.Paned.new(Gtk.Orientation.HORIZONTAL)
+        paned.set_position(400)
+        self.set_child(paned)
+
+        # -------- Left: service list --------
+        left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        paned.set_start_child(left_box)
+
+        # Status bar
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+
+        self.status_label = Gtk.Label(
+            label="Loading services...",
+            xalign=0,
+            hexpand=True,
+            margin_start=10,
+            margin_top=5,
+            margin_bottom=5
+        )
+        self.status_label.add_css_class("dim-label")
+        status_box.append(self.status_label)
+
+        # Privilege indicator
+        if not is_root():
+            priv_label = Gtk.Label(
+                label="🔓 Actions will prompt for password",
+                xalign=1,
+                margin_end=10
+            )
+            priv_label.add_css_class("dim-label")
+            priv_label.add_css_class("caption")
+            priv_label.set_tooltip_text("Running without root privileges - pkexec will prompt when needed")
+            status_box.append(priv_label)
+
+        left_box.append(status_box)
+
+        left_box.append(Gtk.Separator())
+
+        # Service list
+        self.listbox = Gtk.ListBox()
+        self.listbox.set_selection_mode(Gtk.SelectionMode.SINGLE)
+        self.listbox.connect("row-selected", self.on_select)
+
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_vexpand(True)
+        scroll.set_child(self.listbox)
+        left_box.append(scroll)
+
+        # -------- Right: details --------
+        right = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL,
+            spacing=12,
+            margin_top=16,
+            margin_start=16,
+            margin_end=16,
+            margin_bottom=16
+        )
+        paned.set_end_child(right)
+
+        # Service name
+        self.title = Gtk.Label(xalign=0, wrap=True)
+        self.title.add_css_class("title-1")
+        right.append(self.title)
+
+        # Description
+        self.desc = Gtk.Label(xalign=0, wrap=True)
+        self.desc.add_css_class("dim-label")
+        right.append(self.desc)
+
+        # Status badges
+        status_box = Gtk.Box(spacing=8)
+        self.status_badge = Gtk.Label()
+        self.status_badge.add_css_class("badge")
+        status_box.append(self.status_badge)
+
+        self.sub_badge = Gtk.Label()
+        self.sub_badge.add_css_class("badge")
+        status_box.append(self.sub_badge)
+        right.append(status_box)
+
+        right.append(Gtk.Separator())
+
+        # Enable at boot
+        enable_row = Gtk.Box(spacing=10)
+        enable_row.append(Gtk.Label(label="Enable at boot", xalign=0, hexpand=True))
+        self.enable_switch = Gtk.Switch()
+        self.enable_switch.set_valign(Gtk.Align.CENTER)
+        self.enable_switch.connect("notify::active", self.toggle_enable)
+        enable_row.append(self.enable_switch)
+        right.append(enable_row)
+
+        # Action buttons
+        btns = Gtk.Box(spacing=8, homogeneous=True)
+        self.start_btn = Gtk.Button(label="Start")
+        self.start_btn.add_css_class("suggested-action")
+        self.stop_btn = Gtk.Button(label="Stop")
+        self.stop_btn.add_css_class("destructive-action")
+        self.restart_btn = Gtk.Button(label="Restart")
+
+        btns.append(self.start_btn)
+        btns.append(self.stop_btn)
+        btns.append(self.restart_btn)
+        right.append(btns)
+
+        # Operation status
+        self.op_label = Gtk.Label(xalign=0)
+        self.op_label.set_visible(False)
+        right.append(self.op_label)
+
+        # -------- Logs --------
+        right.append(Gtk.Separator())
+
+        log_header = Gtk.Box(spacing=10)
+        log_label = Gtk.Label(label="Logs", xalign=0, hexpand=True)
+        log_label.add_css_class("heading")
+        log_header.append(log_label)
+
+        self.tail_toggle = Gtk.ToggleButton(label="Live Tail")
+        self.tail_toggle.set_tooltip_text("Follow logs in real-time")
+        self.tail_toggle.connect("toggled", self.on_tail_toggled)
+        log_header.append(self.tail_toggle)
+
+        self.refresh_log_btn = Gtk.Button(icon_name="view-refresh-symbolic")
+        self.refresh_log_btn.set_tooltip_text("Refresh logs")
+        self.refresh_log_btn.connect("clicked", self.on_refresh_logs)
+        log_header.append(self.refresh_log_btn)
+
+        right.append(log_header)
+
+        self.log_view = Gtk.TextView(
+            editable=False,
+            monospace=True,
+            wrap_mode=Gtk.WrapMode.NONE,
+            top_margin=8,
+            left_margin=8,
+            right_margin=8,
+            bottom_margin=8
+        )
+        self.log_buffer = self.log_view.get_buffer()
+
+        log_scroll = Gtk.ScrolledWindow()
+        log_scroll.set_vexpand(True)
+        log_scroll.set_min_content_height(200)
+        log_scroll.set_child(self.log_view)
+        right.append(log_scroll)
+
+    # ---------------- logic ----------------
+    def reload(self):
+        """Reload the service list."""
+        self.status_label.set_text("Loading services...")
+
+        def load_task():
+            services = list_services()
+            GLib.idle_add(self.on_services_loaded, services)
+
+        threading.Thread(target=load_task, daemon=True).start()
+
+    def on_services_loaded(self, services):
+        """Handle loaded services."""
+        self.services = services
+        self.refresh_list()
+        count = len(services)
+        self.status_label.set_text(f"{count} service{'s' if count != 1 else ''} loaded")
+
+    def on_filter_toggled(self, btn):
+        """Toggle active-only filter."""
+        self.filter_active_only = btn.get_active()
+        self.refresh_list()
+
+    def refresh_list(self, *_):
+        """Refresh the displayed service list."""
+        self.listbox.remove_all()
+        q = self.search.get_text().lower()
+        count = 0
+
+        for svc in self.services:
+            # Apply filters
+            if self.filter_active_only and svc["active"] != "active":
+                continue
+
+            if q and q not in svc["name"].lower() and q not in svc["desc"].lower():
+                continue
+
+            # Create row
+            row = Gtk.ListBoxRow()
+
+            box = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL,
+                spacing=2,
+                margin_start=10,
+                margin_end=10,
+                margin_top=6,
+                margin_bottom=6
+            )
+
+            name_label = Gtk.Label(label=svc["name"], xalign=0)
+            box.append(name_label)
+
+            # Status indicator
+            status_text = svc["active"]
+            if svc["sub"]:
+                status_text = f"{svc['active']} ({svc['sub']})"
+
+            status_label = Gtk.Label(label=status_text, xalign=0)
+            status_label.add_css_class("dim-label")
+            status_label.add_css_class("caption")
+            box.append(status_label)
+
+            row.set_child(box)
+            row.svc = svc
+            self.listbox.append(row)
+            count += 1
+
+        visible = f"{count} service{'s' if count != 1 else ''}"
+        if q or self.filter_active_only:
+            visible += " (filtered)"
+        self.status_label.set_text(visible)
+
+    def on_select(self, _, row):
+        """Handle service selection."""
+        if not row:
+            return
+
+        # Stop any existing tail
+        self.stop_log_tail()
+
+        svc = row.svc
+        self.current = svc
+
+        # Update details
+        self.title.set_text(svc["name"])
+        self.desc.set_text(svc["desc"])
+
+        # Status badges
+        active_state = svc["active"]
+        self.status_badge.set_text(active_state.capitalize())
+
+        if svc["sub"]:
+            self.sub_badge.set_text(svc["sub"])
+            self.sub_badge.set_visible(True)
+        else:
+            self.sub_badge.set_visible(False)
+
+        # Enable switch
+        self.enable_switch.handler_block_by_func(self.toggle_enable)
+        self.enable_switch.set_active(svc["enabled"])
+        self.enable_switch.handler_unblock_by_func(self.toggle_enable)
+
+        # Button sensitivity
+        is_active = active_state == "active"
+        self.start_btn.set_sensitive(not is_active)
+        self.stop_btn.set_sensitive(is_active)
+        self.restart_btn.set_sensitive(True)
+
+        # Disconnect old handlers
+        for btn in [self.start_btn, self.stop_btn, self.restart_btn]:
+            if hasattr(btn, '_handler_id') and btn._handler_id:
+                btn.disconnect(btn._handler_id)
+
+        # Connect new handlers
+        self.start_btn._handler_id = self.start_btn.connect("clicked", lambda *_: self.do_action("start"))
+        self.stop_btn._handler_id = self.stop_btn.connect("clicked", lambda *_: self.do_action("stop"))
+        self.restart_btn._handler_id = self.restart_btn.connect("clicked", lambda *_: self.do_action("restart"))
+
+        # Load logs
+        self.load_logs()
+
+    def do_action(self, action: str):
+        """Execute a systemctl action."""
+        if not self.current:
+            return
+
+        self.op_label.set_text(f"{action.capitalize()}ing service...")
+        self.op_label.set_visible(True)
+
+        for btn in [self.start_btn, self.stop_btn, self.restart_btn]:
+            btn.set_sensitive(False)
+
+        def callback(success, error):
+            if success:
+                self.op_label.set_text(f"✓ {action.capitalize()} successful")
+                # Reload to get updated status
+                GLib.timeout_add(500, self.reload)
+            else:
+                self.op_label.set_text(f"✗ Failed: {error}")
+
+            GLib.timeout_add(3000, lambda: self.op_label.set_visible(False))
+
+        ctl(action, self.current["name"], callback, self)
+
+    def toggle_enable(self, switch, *_):
+        """Toggle service enable/disable."""
+        if not self.current:
+            return
+
+        action = "enable" if switch.get_active() else "disable"
+        self.op_label.set_text(f"{action.capitalize()}ing service...")
+        self.op_label.set_visible(True)
+
+        def callback(success, error):
+            if success:
+                self.op_label.set_text(f"✓ {action.capitalize()} successful")
+            else:
+                self.op_label.set_text(f"✗ Failed: {error}")
+            GLib.timeout_add(3000, lambda: self.op_label.set_visible(False))
+
+        ctl(action, self.current["name"], callback, self)
+
+    def load_logs(self):
+        """Load logs for current service."""
+        if not self.current:
+            return
+
+        # If tail is active, start it instead
+        if self.tail_toggle.get_active():
+            self.start_log_tail()
+            return
+
+        self.log_buffer.set_text("Loading logs...")
+
+        def task():
+            logs = get_logs(self.current["name"])
+            GLib.idle_add(self.on_logs_loaded, logs)
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def on_logs_loaded(self, logs):
+        """Update log view with loaded logs."""
+        self.log_buffer.set_text(logs if logs else "(no logs available)")
+
+    def on_refresh_logs(self, *_):
+        """Manually refresh logs."""
+        if self.tail_toggle.get_active():
+            self.stop_log_tail()
+            self.start_log_tail()
+        else:
+            self.load_logs()
+
+    def on_tail_toggled(self, toggle):
+        """Handle live tail toggle."""
+        if toggle.get_active():
+            self.start_log_tail()
+        else:
+            self.stop_log_tail()
+
+    def start_log_tail(self):
+        """Start live tailing logs."""
+        if not self.current or self.log_tail_active:
+            return
+
+        self.stop_log_tail()
+        self.log_tail_active = True
+        self.log_buffer.set_text("Starting live tail...\n")
+
+        def tail_logs():
+            try:
+                # Start journalctl in follow mode
+                process = subprocess.Popen(
+                    ["journalctl", "-u", self.current["name"], "-f", "--no-pager", "-n", "50"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    bufsize=1
+                )
+                self.log_tail_process = process
+
+                # Read lines as they come
+                for line in process.stdout:
+                    if not self.log_tail_active:
+                        break
+                    GLib.idle_add(self.append_log_line, line)
+
+            except Exception as e:
+                GLib.idle_add(self.append_log_line, f"\nError: {e}\n")
+            finally:
+                if self.log_tail_process:
+                    self.log_tail_process.terminate()
+                    self.log_tail_process = None
+
+        threading.Thread(target=tail_logs, daemon=True).start()
+
+    def stop_log_tail(self):
+        """Stop live tailing logs."""
+        self.log_tail_active = False
+        if self.log_tail_process:
+            try:
+                self.log_tail_process.terminate()
+                self.log_tail_process.wait(timeout=1)
+            except:
+                pass
+            self.log_tail_process = None
+
+    def append_log_line(self, line):
+        """Append a line to the log view and auto-scroll."""
+        end_iter = self.log_buffer.get_end_iter()
+        self.log_buffer.insert(end_iter, line)
+
+        # Auto-scroll to bottom
+        mark = self.log_buffer.get_insert()
+        self.log_view.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+
+    # ---------------- Status monitoring ----------------
+    def start_status_monitor(self):
+        """Start periodic status monitoring."""
+        self.status_monitor_active = True
+        self._schedule_status_update()
+
+    def stop_status_monitor(self):
+        """Stop periodic status monitoring."""
+        self.status_monitor_active = False
+        if self.status_update_timeout:
+            GLib.source_remove(self.status_update_timeout)
+            self.status_update_timeout = None
+
+    def _schedule_status_update(self):
+        """Schedule the next status update."""
+        if not self.status_monitor_active:
+            return
+
+        def update_and_reschedule():
+            if not self.status_monitor_active:
+                return False
+
+            self.update_current_service_status()
+            self._schedule_status_update()
+            return False
+
+        # Update every 3 seconds
+        self.status_update_timeout = GLib.timeout_add_seconds(3, update_and_reschedule)
+
+    def update_current_service_status(self):
+        """Update status of currently selected service."""
+        if not self.current:
+            return
+
+        def task():
+            # Get fresh status for current service
+            out = run([
+                "systemctl", "show", self.current["name"],
+                "--property=ActiveState,SubState,LoadState",
+                "--no-pager"
+            ])
+
+            if not out:
+                return
+
+            status = {}
+            for line in out.strip().split('\n'):
+                if '=' in line:
+                    key, value = line.split('=', 1)
+                    status[key] = value
+
+            GLib.idle_add(self.on_status_updated, status)
+
+        threading.Thread(target=task, daemon=True).start()
+
+    def on_status_updated(self, status):
+        """Handle updated status information."""
+        if not self.current:
+            return
+
+        # Update current service data
+        active = status.get('ActiveState', self.current['active'])
+        sub = status.get('SubState', self.current['sub'])
+
+        # Check if status changed
+        status_changed = (
+            active != self.current.get('active') or
+            sub != self.current.get('sub')
+        )
+
+        self.current['active'] = active
+        self.current['sub'] = sub
+        self.current['load'] = status.get('LoadState', self.current.get('load', ''))
+
+        # Update UI
+        self.status_badge.set_text(active.capitalize())
+
+        if sub:
+            self.sub_badge.set_text(sub)
+            self.sub_badge.set_visible(True)
+        else:
+            self.sub_badge.set_visible(False)
+
+        # Update button states
+        is_active = active == "active"
+        self.start_btn.set_sensitive(not is_active)
+        self.stop_btn.set_sensitive(is_active)
+
+        # Update the list item if status changed
+        if status_changed:
+            self._update_list_item_status()
+
+    def _update_list_item_status(self):
+        """Update the status display in the list for current service."""
+        if not self.current:
+            return
+
+        # Find and update the row
+        row = self.listbox.get_selected_row()
+        if row and hasattr(row, 'svc') and row.svc['name'] == self.current['name']:
+            # Update the service data in the list
+            for svc in self.services:
+                if svc['name'] == self.current['name']:
+                    svc['active'] = self.current['active']
+                    svc['sub'] = self.current['sub']
+                    break
+
+            # Update the row's visual display
+            box = row.get_child()
+            if box and isinstance(box, Gtk.Box):
+                # Get the status label (second child)
+                status_label = box.get_first_child()
+                if status_label:
+                    status_label = status_label.get_next_sibling()
+                    if status_label:
+                        status_text = self.current['active']
+                        if self.current['sub']:
+                            status_text = f"{self.current['active']} ({self.current['sub']})"
+                        status_label.set_text(status_text)
+
+    def on_monitor_toggled(self, toggle):
+        """Handle status monitoring toggle."""
+        if toggle.get_active():
+            self.start_status_monitor()
+        else:
+            self.stop_status_monitor()
+
+# -------------------------------------------------
+# App
+# -------------------------------------------------
+class App(Gtk.Application):
+    def __init__(self):
+        super().__init__(application_id=APP_ID)
+        self.win = None
+
+        # Set up signal handlers for clean shutdown
+        signal.signal(signal.SIGINT, self._handle_sigint)
+        signal.signal(signal.SIGTERM, self._handle_sigterm)
+
+    def _handle_sigint(self, signum, frame):
+        """Handle Ctrl+C (SIGINT)."""
+        print("\nReceived Ctrl+C, shutting down gracefully...")
+        GLib.idle_add(self.quit)
+
+    def _handle_sigterm(self, signum, frame):
+        """Handle SIGTERM."""
+        print("\nReceived termination signal, shutting down...")
+        GLib.idle_add(self.quit)
+
+    def do_activate(self):
+        if not self.win:
+            self.win = MainWindow(self)
+        self.win.present()
+
+    def do_shutdown(self):
+        """Clean up when app closes."""
+        if self.win:
+            self.win.stop_log_tail()
+            self.win.stop_status_monitor()
+        Gtk.Application.do_shutdown(self)
+
+# -------------------------------------------------
+# main
+# -------------------------------------------------
+if __name__ == "__main__":
+    # No longer force root - let it run as regular user
+    # Actions will prompt for elevation when needed
+    App().run()

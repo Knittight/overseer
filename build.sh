@@ -35,6 +35,7 @@ rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 
 install -m 755 "$SRC_FILE" "$BUILD_DIR/$APP_NAME"
+install -m 644 "overseer.desktop" "$BUILD_DIR/overseer.desktop"
 
 echo "✅ Build complete"
 echo "📂 Output: $BUILD_DIR/$APP_NAME"
